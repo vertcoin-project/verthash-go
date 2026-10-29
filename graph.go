@@ -139,7 +139,14 @@ func generateGraph(index int64, fn string, pk []byte, progress chan float64) (er
 	if err != nil {
 		return err
 	}
-	return os.Rename(tmp, fn)
+	if err = os.Rename(tmp, fn); err != nil {
+		return err
+	}
+	// the ticker's last report is up to a second before the end
+	if progress != nil {
+		progress <- 1
+	}
+	return nil
 }
 
 // openGraph maps an existing graph file read-write.
