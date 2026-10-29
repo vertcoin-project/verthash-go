@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"fmt"
+	"io"
 	"io/ioutil"
 	"os"
 
@@ -26,11 +27,15 @@ func EnsureVerthashDatafile(file string) error {
 }
 
 func EnsureVerthashDatafileWithProgress(file string, progress chan float64) error {
-	MakeVerthashDatafileIfNotExistsWithProgress(file, progress)
+	if err := MakeVerthashDatafileIfNotExistsWithProgress(file, progress); err != nil {
+		return err
+	}
 	ok, err := VerifyVerthashDatafile(file)
 	if err != nil || !ok {
 		os.Remove(file)
-		MakeVerthashDatafileWithProgress(file, progress)
+		if err := MakeVerthashDatafileWithProgress(file, progress); err != nil {
+			return err
+		}
 		ok, err := VerifyVerthashDatafile(file)
 		if err != nil {
 			return err
@@ -69,11 +74,16 @@ func MakeVerthashDatafileWithProgress(file string, progress chan float64) error 
 }
 
 func VerifyVerthashDatafile(file string) (bool, error) {
-	b, err := ioutil.ReadFile(file)
+	f, err := os.Open(file)
 	if err != nil {
 		return false, err
 	}
-	hash := sha256.Sum256(b)
+	defer f.Close()
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return false, err
+	}
+	hash := h.Sum(nil)
 	expectedHash, _ := hex.DecodeString("a55531e843cd56b010114aaf6325b0d529ecf88f8ad47639b6ededafd721aa48")
 	if !bytes.Equal(hash[:], expectedHash) {
 		return false, fmt.Errorf("Generated file has wrong hash: %x vs %x", hash, expectedHash)
