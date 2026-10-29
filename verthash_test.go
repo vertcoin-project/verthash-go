@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 )
 
@@ -59,5 +60,32 @@ func TestHashMemory(t *testing.T) {
 	if !bytes.Equal(h[:], verthashTestOutput) {
 		//os.Remove("/tmp/verthash.dat")
 		t.Errorf("Verthash output invalid: %x vs %x", h, verthashTestOutput)
+	}
+}
+
+// One Verthash is shared by goroutines hashing at the same time, from the file
+// and from the mapping.
+func TestHashConcurrent(t *testing.T) {
+	for _, keepInRam := range []bool{false, true} {
+		vh, err := NewVerthash(testDatafile, keepInRam)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var wg sync.WaitGroup
+		for g := 0; g < 8; g++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				for i := 0; i < 20; i++ {
+					h, err := vh.SumVerthash(verthashTestInput)
+					if err != nil || !bytes.Equal(h[:], verthashTestOutput) {
+						t.Errorf("keepInRam=%v: got %x, %v", keepInRam, h, err)
+						return
+					}
+				}
+			}()
+		}
+		wg.Wait()
+		vh.Close()
 	}
 }

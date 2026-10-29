@@ -7,7 +7,6 @@ import (
 	"encoding/hex"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"os"
 
 	"golang.org/x/crypto/sha3"
@@ -94,32 +93,56 @@ func VerifyVerthashDatafile(file string) (bool, error) {
 type Verthash struct {
 	datFileContent []byte
 	datFile        *os.File
+	datFileSize    int64
+	isMmap         bool
 }
 
 func fnv1a(a, b uint32) uint32 {
 	return (a ^ b) * 0x1000193
 }
 
+// NewVerthash opens the datafile for SumVerthash. With keepInRam it is mapped
+// read-only, so it stays in the OS page cache, is shared with other processes
+// that map it, and is never written to swap; if it can't be mapped, it is read
+// into memory. Without keepInRam every hash reads it from the file.
 func NewVerthash(datFileLocation string, keepInRam bool) (*Verthash, error) {
 	v := Verthash{}
-	var err error
-	if keepInRam {
-		v.datFileContent, err = ioutil.ReadFile(datFileLocation)
-	} else {
-		v.datFile, err = os.Open(datFileLocation)
-	}
+	f, err := os.Open(datFileLocation)
 	if err != nil {
 		return nil, err
+	}
+	s, err := f.Stat()
+	if err != nil {
+		f.Close()
+		return nil, err
+	}
+	v.datFile = f
+	v.datFileSize = s.Size()
+
+	if keepInRam && v.datFileSize > 0 {
+		if mapped, err := mapFileReadOnly(f, v.datFileSize); err == nil {
+			v.datFileContent = mapped
+			v.isMmap = true
+			return &v, nil
+		}
+		v.datFileContent, err = os.ReadFile(datFileLocation)
+		if err != nil {
+			f.Close()
+			return nil, err
+		}
 	}
 
 	return &v, nil
 }
 
 func (v *Verthash) Close() {
-	if v.datFileContent != nil {
-		v.datFileContent = []byte{}
-	} else {
+	if v.isMmap && v.datFileContent != nil {
+		unmapFile(v.datFileContent)
+	}
+	v.datFileContent = nil
+	if v.datFile != nil {
 		v.datFile.Close()
+		v.datFile = nil
 	}
 }
 
@@ -138,10 +161,9 @@ func (v *Verthash) SumVerthash(input []byte) ([32]byte, error) {
 		copy(p0[i*VerthashP0Size:], digest64[:])
 	}
 
-	buf := bytes.NewBuffer(p0)
 	p0Index := make([]uint32, len(p0)/4)
 	for i := 0; i < len(p0Index); i++ {
-		binary.Read(buf, binary.LittleEndian, &p0Index[i])
+		p0Index[i] = binary.LittleEndian.Uint32(p0[i*4 : (i+1)*4])
 	}
 
 	seekIndexes := make([]uint32, VerthashIndexes)
@@ -153,36 +175,25 @@ func (v *Verthash) SumVerthash(input []byte) ([32]byte, error) {
 		}
 	}
 
-	var datFileSize int64
+	mdiv := ((uint32(v.datFileSize) - VerthashHashOutSize) / VerthashByteAlignment) + 1
+	valueAccumulator := uint32(0x811c9dc5)
 
-	if v.datFileContent == nil {
-		s, err := v.datFile.Stat()
-		if err != nil {
-			return [32]byte{}, err
-		}
-		datFileSize = s.Size()
-	} else {
-		datFileSize = int64(len(v.datFileContent))
-	}
-
-	var valueAccumulator uint32
-	var mdiv uint32
-	mdiv = ((uint32(datFileSize) - VerthashHashOutSize) / VerthashByteAlignment) + 1
-	valueAccumulator = uint32(0x811c9dc5)
-	buf = bytes.NewBuffer(p1[:])
 	p1Arr := make([]uint32, VerthashHashOutSize/4)
 	for i := 0; i < len(p1Arr); i++ {
-		binary.Read(buf, binary.LittleEndian, &p1Arr[i])
+		p1Arr[i] = binary.LittleEndian.Uint32(p1[i*4 : (i+1)*4])
 	}
+
+	data := make([]byte, 32)
 	for i := uint32(0); i < VerthashIndexes; i++ {
 		offset := (fnv1a(seekIndexes[i], valueAccumulator) % mdiv) * VerthashByteAlignment
 
-		data := make([]byte, 32)
 		if v.datFileContent != nil {
 			data = v.datFileContent[offset : offset+VerthashHashOutSize]
 		} else {
-			v.datFile.Seek(int64(offset), 0)
-			v.datFile.Read(data)
+			// ReadAt doesn't move a shared file offset, so goroutines can hash at once
+			if _, err := v.datFile.ReadAt(data, int64(offset)); err != nil {
+				return [32]byte{}, err
+			}
 		}
 
 		for i2 := uint32(0); i2 < VerthashHashOutSize/4; i2++ {
