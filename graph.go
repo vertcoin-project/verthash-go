@@ -3,7 +3,9 @@ package verthash
 import (
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"os"
+	"path/filepath"
 	"sync/atomic"
 	"time"
 
@@ -12,6 +14,10 @@ import (
 
 const hashSize = 32
 const nodeSize = hashSize
+
+// minFreeSpace is what generation leaves free on the disk, as Bitcoin Core's
+// CheckDiskSpace does.
+const minFreeSpace = 50 << 20
 
 type Graph struct {
 	pk    []byte
@@ -102,8 +108,13 @@ func generateGraph(index int64, fn string, pk []byte, progress chan float64) (er
 
 	g := newGraphParams(index, fn, pk)
 	length := g.size * nodeSize
-	if err = f.Truncate(length); err != nil {
-		return err
+	// os.Create emptied any .tmp left by an interrupted run, so its space counts as free
+	if free, ok := freeSpace(filepath.Dir(tmp)); ok && free < uint64(length)+minFreeSpace {
+		return fmt.Errorf("not enough disk space for the Verthash datafile: it needs %d MiB and %s has %d MiB free",
+			(uint64(length)+minFreeSpace)>>20, filepath.Dir(fn), free>>20)
+	}
+	if err = reserveFile(f, length); err != nil {
+		return fmt.Errorf("could not reserve %d MiB for the Verthash datafile: %w", length>>20, err)
 	}
 	if g.data, err = mapFile(f, length); err != nil {
 		return err
