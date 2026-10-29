@@ -1,4 +1,4 @@
-module github.com/gertjaap/verthash-go
+module github.com/vertcoin-project/verthash-go
 
 go 1.18
 
