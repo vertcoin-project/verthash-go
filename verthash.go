@@ -60,11 +60,12 @@ func MakeVerthashDatafile(file string) error {
 }
 
 func MakeVerthashDatafileWithProgress(file string, progress chan float64) error {
+	if _, err := os.Stat(file); err == nil {
+		return nil // an existing file is left alone, as NewGraph does
+	}
 	pk := sha3.Sum256([]byte("Verthash Proof-of-Space Datafile"))
 
-	NewGraph(17, file, pk[:], progress)
-
-	return nil
+	return generateGraph(17, file, pk[:], progress)
 }
 
 func VerifyVerthashDatafile(file string) (bool, error) {

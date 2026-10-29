@@ -2,14 +2,12 @@ package verthash
 
 import (
 	"encoding/binary"
+	"errors"
+	"os"
+	"sync/atomic"
 	"time"
 
-	//"fmt"
-
-	"os"
-
 	"golang.org/x/crypto/sha3"
-	//"runtime/pprof"
 )
 
 const hashSize = 32
@@ -18,11 +16,15 @@ const nodeSize = hashSize
 type Graph struct {
 	pk    []byte
 	fn    string
-	db    *os.File
+	f     *os.File
+	data  []byte // the file, memory-mapped; node n is at bfsToPost(n)*nodeSize
 	index int64
 	log2  int64
 	pow2  int64
 	size  int64
+	done  int64 // nodes generated so far, read by the progress reporter
+
+	in [4 * hashSize]byte // hash input: pk, varint id, up to two parents
 }
 
 type Node struct {
@@ -47,26 +49,7 @@ func Log2(x int64) int64 {
 	return r
 }
 
-// Generate a new PoS graph of index
-// Currently only supports the weaker PoS graph
-// Note that this graph will have O(2^index) nodes
-func NewGraph(index int64, fn string, pk []byte, progress chan float64) *Graph {
-
-	var db *os.File
-	_, err := os.Stat(fn)
-	fileExists := err == nil
-	if fileExists { //file exists
-		db, err = os.OpenFile(fn, os.O_RDWR, 0666)
-		if err != nil {
-			panic(err)
-		}
-	} else {
-		db, err = os.Create(fn)
-		if err != nil {
-			panic(err)
-		}
-	}
-
+func newGraphParams(index int64, fn string, pk []byte) *Graph {
 	size := numXi(index)
 	log2 := Log2(size) + 1
 	pow2 := int64(1 << log2)
@@ -74,41 +57,113 @@ func NewGraph(index int64, fn string, pk []byte, progress chan float64) *Graph {
 	g := &Graph{
 		pk:    pk,
 		fn:    fn,
-		db:    db,
 		index: index,
 		log2:  log2,
 		size:  size,
 		pow2:  pow2,
 	}
+	copy(g.in[:hashSize], pk)
+	return g
+}
 
-	done := make(chan bool, 1)
-	if !fileExists {
-		go func() {
-			g.XiGraphIter(index)
-			done <- true
-		}()
-
-		for {
-			genDone := false
-			select {
-			case genDone = <-done:
-			case <-time.After(1 * time.Second):
-			}
-
-			if genDone {
-				break
-			}
-			if progress != nil {
-				s, err := g.db.Stat()
-				if err == nil {
-					progress <- float64(s.Size()) / float64(1283457024)
-				}
-			}
+// Generate a new PoS graph of index
+// Currently only supports the weaker PoS graph
+// Note that this graph will have O(2^index) nodes
+// If fn already exists it is opened as is, without checking it.
+func NewGraph(index int64, fn string, pk []byte, progress chan float64) *Graph {
+	if _, err := os.Stat(fn); err != nil {
+		if err := generateGraph(index, fn, pk, progress); err != nil {
+			panic(err)
 		}
+	}
+	g, err := openGraph(index, fn, pk)
+	if err != nil {
+		panic(err)
+	}
+	return g
+}
 
+// generateGraph writes the graph to fn+".tmp" through a memory map and renames
+// it to fn once it is complete, so an interrupted run never leaves a partial fn.
+func generateGraph(index int64, fn string, pk []byte, progress chan float64) (err error) {
+	tmp := fn + ".tmp"
+	f, err := os.Create(tmp)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if f != nil {
+			f.Close()
+		}
+		if err != nil {
+			os.Remove(tmp)
+		}
+	}()
+
+	g := newGraphParams(index, fn, pk)
+	length := g.size * nodeSize
+	if err = f.Truncate(length); err != nil {
+		return err
+	}
+	if g.data, err = mapFile(f, length); err != nil {
+		return err
 	}
 
-	return g
+	done := make(chan bool, 1)
+	go func() {
+		g.XiGraphIter(index)
+		done <- true
+	}()
+
+	ticker := time.NewTicker(1 * time.Second)
+	for genDone := false; !genDone; {
+		select {
+		case genDone = <-done:
+		case <-ticker.C:
+			if progress != nil {
+				progress <- float64(atomic.LoadInt64(&g.done)) / float64(g.size)
+			}
+		}
+	}
+	ticker.Stop()
+
+	err = flushMap(f, g.data)
+	if uerr := unmapFile(g.data); err == nil {
+		err = uerr
+	}
+	g.data = nil
+	if cerr := f.Close(); err == nil {
+		err = cerr
+	}
+	f = nil
+	if err != nil {
+		return err
+	}
+	return os.Rename(tmp, fn)
+}
+
+// openGraph maps an existing graph file read-write.
+func openGraph(index int64, fn string, pk []byte) (*Graph, error) {
+	f, err := os.OpenFile(fn, os.O_RDWR, 0666)
+	if err != nil {
+		return nil, err
+	}
+	st, err := f.Stat()
+	if err != nil {
+		f.Close()
+		return nil, err
+	}
+	if st.Size() == 0 {
+		f.Close()
+		return nil, errors.New("verthash: graph file is empty")
+	}
+	g := newGraphParams(index, fn, pk)
+	if g.data, err = mapFile(f, st.Size()); err != nil {
+		f.Close()
+		return nil, err
+	}
+	g.f = f
+	return g, nil
 }
 
 // compute parents of nodes
@@ -220,44 +275,63 @@ func (g *Graph) NewNode(id int64, hash []byte) {
 }
 
 func (g *Graph) GetId(id int64) *Node {
-	//fmt.Println("read id", id)
-	node := new(Node)
 	data := make([]byte, nodeSize)
-	num, err := g.db.ReadAt(data, id*nodeSize)
-	if err != nil || num != nodeSize {
-		panic(err)
-	}
-	node.H = data
-	return node
+	copy(data, g.data[id*nodeSize:(id+1)*nodeSize])
+	return &Node{H: data}
 }
 
 func (g *Graph) WriteId(node *Node, id int64) {
-	//fmt.Println("write id", id)
-	num, err := g.db.WriteAt(node.H, id*nodeSize)
-	if err != nil || num != nodeSize {
-		panic(err)
+	if len(node.H) != nodeSize {
+		panic("verthash: node is not 32 bytes")
 	}
+	copy(g.data[id*nodeSize:(id+1)*nodeSize], node.H)
 }
 
 func (g *Graph) GetNode(id int64) *Node {
 	idx := g.bfsToPost(id)
-	//fmt.Println("read", idx)
 	return g.GetId(idx)
 }
 
 func (g *Graph) WriteNode(node *Node, id int64) {
 	idx := g.bfsToPost(id)
-	//fmt.Println("write", idx)
 	g.WriteId(node, idx)
 }
 
 func (g *Graph) Close() {
-	g.db.Close()
+	if g.data != nil {
+		unmapFile(g.data)
+		g.data = nil
+	}
+	if g.f != nil {
+		g.f.Close()
+		g.f = nil
+	}
 }
 
 // post-order is better for disk than bfs~
 func (g *Graph) bfsToPost(node int64) int64 {
 	return node & (^(g.pow2))
+}
+
+// node returns node id's bytes in the mapped file.
+func (g *Graph) node(id int64) []byte {
+	off := g.bfsToPost(id) * nodeSize
+	return g.data[off : off+nodeSize : off+nodeSize]
+}
+
+// hashNode sets node id to SHA3-256(pk || varint(id) padded to 32 bytes || parents...).
+func (g *Graph) hashNode(id int64, parents ...[]byte) {
+	vi := g.in[hashSize : 2*hashSize]
+	for i := range vi {
+		vi[i] = 0
+	}
+	binary.PutVarint(vi, id)
+	n := 2 * hashSize
+	for _, p := range parents {
+		n += copy(g.in[n:], p)
+	}
+	hash := sha3.Sum256(g.in[:n])
+	copy(g.node(id), hash[:])
 }
 
 func numXi(index int64) int64 {
@@ -289,19 +363,13 @@ func (g *Graph) ButterflyGraph(index int64, count *int64) {
 			} else {
 				prev = i - (1 << uint64(shift))
 			}
-			parent0 := g.GetNode(begin + (level-1)*perLevel + prev)
-			parent1 := g.GetNode(*count - perLevel)
+			parent0 := g.node(begin + (level-1)*perLevel + prev)
+			parent1 := g.node(*count - perLevel)
 
-			ph := append(parent0.H, parent1.H...)
-			buf := make([]byte, hashSize)
-			binary.PutVarint(buf, *count)
-			val := append(g.pk, buf...)
-			val = append(val, ph...)
-			hash := sha3.Sum256(val)
-
-			g.NewNode(*count, hash[:])
+			g.hashNode(*count, parent0, parent1)
 			*count++
 		}
+		atomic.StoreInt64(&g.done, *count-g.pow2)
 	}
 }
 
@@ -316,12 +384,7 @@ func (g *Graph) XiGraphIter(index int64) {
 	graph := 0
 	pow2index := int64(1 << uint64(index))
 	for i = 0; i < pow2index; i++ { //sources at this level
-		buf := make([]byte, hashSize)
-		binary.PutVarint(buf, count)
-		val := append(g.pk, buf...)
-		hash := sha3.Sum256(val)
-
-		g.NewNode(count, hash[:])
+		g.hashNode(count)
 		count++
 	}
 
@@ -345,17 +408,7 @@ func (g *Graph) XiGraphIter(index int64) {
 			// sources to sources of first butterfly
 			// create sources of first butterly
 			for i = 0; i < pow2index_1; i++ {
-				parent0 := g.GetNode(sources + i)
-				parent1 := g.GetNode(sources + i + pow2index_1)
-
-				ph := append(parent0.H, parent1.H...)
-				buf := make([]byte, hashSize)
-				binary.PutVarint(buf, count)
-				val := append(g.pk, buf...)
-				val = append(val, ph...)
-				hash := sha3.Sum256(val)
-
-				g.NewNode(count, hash[:])
+				g.hashNode(count, g.node(sources+i), g.node(sources+i+pow2index_1))
 				count++
 			}
 		} else if graph == 1 {
@@ -364,15 +417,7 @@ func (g *Graph) XiGraphIter(index int64) {
 			for i = 0; i < pow2index_1; i++ {
 				nodeId := firstXi + i
 				// index is the last level; i.e., sinks
-				parent := g.GetNode(firstXi - pow2index_1 + i)
-
-				buf := make([]byte, hashSize)
-				binary.PutVarint(buf, nodeId)
-				val := append(g.pk, buf...)
-				val = append(val, parent.H...)
-				hash := sha3.Sum256(val)
-
-				g.NewNode(nodeId, hash[:])
+				g.hashNode(nodeId, g.node(firstXi-pow2index_1+i))
 				count++
 			}
 		} else if graph == 2 {
@@ -380,15 +425,7 @@ func (g *Graph) XiGraphIter(index int64) {
 			// sinks of first xi to sources of second xi
 			for i = 0; i < pow2index_1; i++ {
 				nodeId := secondXi + i
-				parent := g.GetNode(secondXi - pow2index_1 + i)
-
-				buf := make([]byte, hashSize)
-				binary.PutVarint(buf, nodeId)
-				val := append(g.pk, buf...)
-				val = append(val, parent.H...)
-				hash := sha3.Sum256(val)
-
-				g.NewNode(nodeId, hash[:])
+				g.hashNode(nodeId, g.node(secondXi-pow2index_1+i))
 				count++
 			}
 		} else if graph == 3 {
@@ -396,15 +433,7 @@ func (g *Graph) XiGraphIter(index int64) {
 			// sinks of second xi to sources of second butterfly
 			for i = 0; i < pow2index_1; i++ {
 				nodeId := secondButter + i
-				parent := g.GetNode(secondButter - pow2index_1 + i)
-
-				buf := make([]byte, hashSize)
-				binary.PutVarint(buf, nodeId)
-				val := append(g.pk, buf...)
-				val = append(val, parent.H...)
-				hash := sha3.Sum256(val)
-
-				g.NewNode(nodeId, hash[:])
+				g.hashNode(nodeId, g.node(secondButter-pow2index_1+i))
 				count++
 			}
 		} else {
@@ -413,28 +442,14 @@ func (g *Graph) XiGraphIter(index int64) {
 			for i = 0; i < pow2index_1; i++ {
 				nodeId0 := sinks + i
 				nodeId1 := sinks + i + pow2index_1
-				parent0 := g.GetNode(sinks - pow2index_1 + i)
-				parent1_0 := g.GetNode(sources + i)
-				parent1_1 := g.GetNode(sources + i + pow2index_1)
+				parent0 := g.node(sinks - pow2index_1 + i)
 
-				ph := append(parent0.H, parent1_0.H...)
-				buf := make([]byte, hashSize)
-				binary.PutVarint(buf, nodeId0)
-				val := append(g.pk, buf...)
-				val = append(val, ph...)
-				hash1 := sha3.Sum256(val)
-
-				ph = append(parent0.H, parent1_1.H...)
-				binary.PutVarint(buf, nodeId1)
-				val = append(g.pk, buf...)
-				val = append(val, ph...)
-				hash2 := sha3.Sum256(val)
-
-				g.NewNode(nodeId0, hash1[:])
-				g.NewNode(nodeId1, hash2[:])
+				g.hashNode(nodeId0, parent0, g.node(sources+i))
+				g.hashNode(nodeId1, parent0, g.node(sources+i+pow2index_1))
 				count += 2
 			}
 		}
+		atomic.StoreInt64(&g.done, count-g.pow2)
 
 		if (graph == 0 || graph == 3) ||
 			((graph == 1 || graph == 2) && index == 2) {
@@ -458,12 +473,7 @@ func (g *Graph) XiGraph(index int64, count *int64) {
 
 	if *count == g.pow2 {
 		for i = 0; i < pow2index; i++ {
-			buf := make([]byte, hashSize)
-			binary.PutVarint(buf, *count)
-			val := append(g.pk, buf...)
-			hash := sha3.Sum256(val)
-
-			g.NewNode(*count, hash[:])
+			g.hashNode(*count)
 			*count++
 		}
 	}
@@ -484,17 +494,7 @@ func (g *Graph) XiGraph(index int64, count *int64) {
 	// sources to sources of first butterfly
 	// create sources of first butterly
 	for i = 0; i < pow2index_1; i++ {
-		parent0 := g.GetNode(sources + i)
-		parent1 := g.GetNode(sources + i + pow2index_1)
-
-		ph := append(parent0.H, parent1.H...)
-		buf := make([]byte, hashSize)
-		binary.PutVarint(buf, *count)
-		val := append(g.pk, buf...)
-		val = append(val, ph...)
-		hash := sha3.Sum256(val)
-
-		g.NewNode(*count, hash[:])
+		g.hashNode(*count, g.node(sources+i), g.node(sources+i+pow2index_1))
 		*count++
 	}
 
@@ -502,15 +502,7 @@ func (g *Graph) XiGraph(index int64, count *int64) {
 	// sinks of first butterfly to sources of first xi graph
 	for i = 0; i < pow2index_1; i++ {
 		nodeId := firstXi + i
-		parent := g.GetNode(firstXi - pow2index_1 + i)
-
-		buf := make([]byte, hashSize)
-		binary.PutVarint(buf, nodeId)
-		val := append(g.pk, buf...)
-		val = append(val, parent.H...)
-		hash := sha3.Sum256(val)
-
-		g.NewNode(nodeId, hash[:])
+		g.hashNode(nodeId, g.node(firstXi-pow2index_1+i))
 		*count++
 	}
 
@@ -518,15 +510,7 @@ func (g *Graph) XiGraph(index int64, count *int64) {
 	// sinks of first xi to sources of second xi
 	for i = 0; i < pow2index_1; i++ {
 		nodeId := secondXi + i
-		parent := g.GetNode(secondXi - pow2index_1 + i)
-
-		buf := make([]byte, hashSize)
-		binary.PutVarint(buf, nodeId)
-		val := append(g.pk, buf...)
-		val = append(val, parent.H...)
-		hash := sha3.Sum256(val)
-
-		g.NewNode(nodeId, hash[:])
+		g.hashNode(nodeId, g.node(secondXi-pow2index_1+i))
 		*count++
 	}
 
@@ -534,15 +518,7 @@ func (g *Graph) XiGraph(index int64, count *int64) {
 	// sinks of second xi to sources of second butterfly
 	for i = 0; i < pow2index_1; i++ {
 		nodeId := secondButter + i
-		parent := g.GetNode(secondButter - pow2index_1 + i)
-
-		buf := make([]byte, hashSize)
-		binary.PutVarint(buf, nodeId)
-		val := append(g.pk, buf...)
-		val = append(val, parent.H...)
-		hash := sha3.Sum256(val)
-
-		g.NewNode(nodeId, hash[:])
+		g.hashNode(nodeId, g.node(secondButter-pow2index_1+i))
 		*count++
 	}
 
@@ -553,25 +529,10 @@ func (g *Graph) XiGraph(index int64, count *int64) {
 	for i = 0; i < pow2index_1; i++ {
 		nodeId0 := sinks + i
 		nodeId1 := sinks + i + pow2index_1
-		parent0 := g.GetNode(sinks - pow2index_1 + i)
-		parent1_0 := g.GetNode(sources + i)
-		parent1_1 := g.GetNode(sources + i + pow2index_1)
+		parent0 := g.node(sinks - pow2index_1 + i)
 
-		ph := append(parent0.H, parent1_0.H...)
-		buf := make([]byte, hashSize)
-		binary.PutVarint(buf, nodeId0)
-		val := append(g.pk, buf...)
-		val = append(val, ph...)
-		hash1 := sha3.Sum256(val)
-
-		ph = append(parent0.H, parent1_1.H...)
-		binary.PutVarint(buf, nodeId1)
-		val = append(g.pk, buf...)
-		val = append(val, ph...)
-		hash2 := sha3.Sum256(val)
-
-		g.NewNode(nodeId0, hash1[:])
-		g.NewNode(nodeId1, hash2[:])
+		g.hashNode(nodeId0, parent0, g.node(sources+i))
+		g.hashNode(nodeId1, parent0, g.node(sources+i+pow2index_1))
 		*count += 2
 	}
 }
